@@ -20,9 +20,6 @@ import sys
 import os
 import re
 
-IMAGE_MIME_TYPES = {
-    "image/png", "image/jpeg", "image/gif", "image/bmp", "image/webp"
-}
 IMAGE_MIME_RE = r'image/.+'
 
 class Tui:
