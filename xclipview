@@ -43,6 +43,10 @@ class Tui:
                 'hdr_target': 6,
                 'key': 7,
                 }
+        self.ATTRS = {
+            'header':     curses.A_BOLD,
+            'hdr_active': curses.A_BOLD,
+        }
 
     def setup(self):
         """Initializes colors and fetches initial data."""
@@ -56,11 +60,16 @@ class Tui:
         curses.init_pair(self.COLORS['default'], curses.COLOR_WHITE, -1)
         curses.init_pair(self.COLORS['highlight'], curses.COLOR_BLACK, curses.COLOR_WHITE)
         curses.init_pair(self.COLORS['special'], 244, -1) # Grey
-        curses.init_pair(self.COLORS['header'], curses.COLOR_YELLOW, curses.COLOR_BLUE)
-        curses.init_pair(self.COLORS['hdr_active'], curses.COLOR_BLACK, curses.COLOR_YELLOW)
+        curses.init_pair(self.COLORS['header'], curses.COLOR_WHITE, curses.COLOR_BLUE)
+        curses.init_pair(self.COLORS['hdr_active'], curses.COLOR_WHITE, curses.COLOR_YELLOW)
         curses.init_pair(self.COLORS['key'], curses.COLOR_CYAN, -1)
         curses.init_pair(self.COLORS['hdr_target'], curses.COLOR_BLUE, curses.COLOR_BLACK)
 
+    def _get_style(self, name):
+        """Combine the color-pair and any extra attrs (bold, underline, etc)."""
+        color = curses.color_pair(self.COLORS.get(name, self.COLORS['default']))
+        attr  = self.ATTRS.get(name, 0)
+        return color | attr
 
     def _safe_addstr(self, win, y, x, text, attr=None):
         """A robust replacement for addstr that only truncates, preventing errors."""
@@ -150,17 +159,26 @@ class Tui:
         # 3. Draw the content pane ON TOP of the refreshed background
         self._draw_right_pane(height, width)
 
+    def _get_attr(self, s):
+        return self.ATTRS.get(s, 0)
 
     def _draw_header(self, height, width):
         x_pos = 1
-        for i, selection in enumerate(self.selections):
-            style = self.COLORS['hdr_active'] if i == self.current_selection_index else self.COLORS['header']
-            display_text = f" {selection.upper()} "
-            self._safe_addstr(self.stdscr, 0, x_pos, display_text, curses.color_pair(style))
-            x_pos += len(display_text) + 1
-        self._safe_addstr(self.stdscr, 1, 0, "─" * width)
-        xclip_cmd = f"$ xclip -selection {self.selections[self.current_selection_index]} -t TARGETS -o"
-        self._safe_addstr(self.stdscr, 2, 0, xclip_cmd)
+        for idx, sel in enumerate(self.selections):
+            # pick the right style name
+            style_name = 'hdr_active' if idx == self.current_selection_index else 'header'
+            text = f" {sel.upper()} "
+            self._safe_addstr(
+                self.stdscr, 0, x_pos,
+                text,
+                self._get_style(style_name)
+            )
+            x_pos += len(text) + 1
+
+        # underline
+        self._safe_addstr(self.stdscr, 1, 0, "─" * width, self._get_style('header'))
+        cmd = f"$ xclip -selection {self.selections[self.current_selection_index]} -t TARGETS -o"
+        self._safe_addstr(self.stdscr, 2, 0, cmd, self._get_style('header'))
 
     def _draw_left_pane(self, height, width):
         """Draws left pane, sanitizing target names before display."""
