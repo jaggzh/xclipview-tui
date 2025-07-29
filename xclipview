@@ -2,16 +2,15 @@
 # -*- coding: utf-8 -*-
 
 """
-An interactive TUI (Text User Interface) clipboard viewer using xclip.
+An interactive TUI clipboard viewer that uses a modal, full-screen
+viewer for image content via chafa.
 
-This script features a dynamic, resilient layout with a full-height pane
-separator and correctly handles all text drawing to prevent crashes.
-
-Controls:
+Controls (TUI Mode):
 - Left/Right Arrows (h/l): Switch between primary, secondary, and clipboard.
 - Up/Down Arrows (k/j):   Navigate the list of available targets.
 - r:                      Reload the content of the current clipboard.
 - q:                      Quit the application.
+- Enter:                  View image target with chafa.
 """
 import curses
 import subprocess
@@ -19,6 +18,12 @@ import datetime
 import textwrap
 import sys
 import os
+import re
+
+IMAGE_MIME_TYPES = {
+    "image/png", "image/jpeg", "image/gif", "image/bmp", "image/webp"
+}
+IMAGE_MIME_RE = r'image/.+'
 
 class Tui:
     """The main class for the Text User Interface."""
@@ -29,7 +34,8 @@ class Tui:
         self.stdscr = stdscr
         self.selections = ['primary', 'secondary', 'clipboard']
         self.current_selection_index = 0
-        self.targets, self.contents, self.navigable_indices = [], {}, []
+        self.target_data = {}
+        self.targets, self.navigable_indices = [], []
         self.selected_nav_index = 0
         self.COLORS = { 'default': 1, 'highlight': 2, 'special': 3, 'header': 4, 'header_active': 5, 'key': 6 }
 
@@ -62,8 +68,8 @@ class Tui:
         except curses.error: pass
 
     def fetch_clipboard_data(self):
-        """Fetches all targets and content for the current clipboard."""
-        self.targets, self.contents, self.navigable_indices = [], {}, []
+        """Fetches all targets and their raw content (bytes)."""
+        self.targets, self.target_data, self.navigable_indices = [], {}, []
         self.selected_nav_index = 0
         selection_name = self.selections[self.current_selection_index]
         try:
@@ -79,19 +85,21 @@ class Tui:
                     ["xclip", "-selection", selection_name, "-t", target, "-o"],
                     stderr=subprocess.DEVNULL
                 )
-                decoded_content = "".join(
-                    char if char.isprintable() or char in '\n\t' else '.'
-                    for char in content_bytes.decode('utf-8', errors='replace')
-                )
-                self.contents[target] = decoded_content
-                if decoded_content: self.navigable_indices.append(i)
-            except subprocess.CalledProcessError: self.contents[target] = ""
+                self.target_data[target] = content_bytes
+                if content_bytes: self.navigable_indices.append(i)
+            except subprocess.CalledProcessError: self.target_data[target] = b""
 
     def handle_input(self, key):
         """Processes user key presses."""
-        if key == ord('q'): return False
+        if key == ord('q'): return "QUIT"
         
-        if key == ord('r'):
+        if key == curses.KEY_ENTER or key == 10 or key == 13:
+            if self.navigable_indices:
+                idx = self.navigable_indices[self.selected_nav_index]
+                if re.match(IMAGE_MIME_RE, self.targets[idx]):
+                    return "SHOW_IMAGE"
+
+        elif key == ord('r'):
             curses.flash()
             self.fetch_clipboard_data()
         elif key in (ord('j'), curses.KEY_DOWN):
@@ -104,19 +112,20 @@ class Tui:
         elif key in (ord('l'), curses.KEY_RIGHT):
             if self.current_selection_index < len(self.selections) - 1:
                 self.current_selection_index += 1; self.fetch_clipboard_data()
-        return True
+        return "CONTINUE"
 
     def run_loop(self):
-        """Main application loop."""
-        running = True
-        while running:
+        """Main application loop. Returns an action to the main controller."""
+        action = "CONTINUE"
+        while action == "CONTINUE":
             self.draw()
             key = self.stdscr.getch()
             if key == curses.KEY_RESIZE: continue
-            running = self.handle_input(key)
+            action = self.handle_input(key)
+        return action
 
     def draw(self):
-        """Main drawing function."""
+        """Main drawing function with the CORRECT refresh order."""
         height, width = self.stdscr.getmaxyx()
         self.stdscr.erase()
         if height < self.MIN_HEIGHT or width < self.MIN_WIDTH:
@@ -124,10 +133,17 @@ class Tui:
             self.stdscr.refresh()
             return
         
+        # --- FIX IS HERE: Restore correct drawing order ---
+        # 1. Draw background elements
         self._draw_header(height, width)
         self._draw_left_pane(height, width)
+        
+        # 2. Refresh the main screen to paint the background
         self.stdscr.refresh()
+
+        # 3. Draw the content pane ON TOP of the refreshed background
         self._draw_right_pane(height, width)
+
 
     def _draw_header(self, height, width):
         x_pos = 1
@@ -141,93 +157,164 @@ class Tui:
         self._safe_addstr(self.stdscr, 2, 0, xclip_cmd)
 
     def _draw_left_pane(self, height, width):
-        """Draws left pane with a full-height separator line that is never overwritten."""
+        """Draws left pane, sanitizing target names before display."""
         pane_width = width // 3
         
-        self._safe_addstr(self.stdscr, 3, 0, "TARGETS:")
-        
         current_target_index = self.navigable_indices[self.selected_nav_index] if self.navigable_indices else -1
+        
+        self._safe_addstr(self.stdscr, 3, 0, "TARGETS:")
         
         last_y = 3
         for i, target in enumerate(self.targets):
             y = 4 + i
             if y >= height - 1: break
-            display_str = target
             
-            # Clear line segment before drawing
+            sanitized_target_name = "".join(c for c in target if c.isprintable())
+            display_str = sanitized_target_name
+            
             self.stdscr.addstr(y, 0, ' ' * (pane_width))
             
             if i == current_target_index: attr = curses.color_pair(self.COLORS['highlight'])
-            elif not self.contents.get(target): attr = curses.color_pair(self.COLORS['special']); display_str = f"* {target}"
+            elif not self.target_data.get(target): attr = curses.color_pair(self.COLORS['special']); display_str = f"* {sanitized_target_name}"
             else: attr = curses.color_pair(self.COLORS['default'])
                 
-            if target == "TIMESTAMP" and self.contents.get(target):
-                try: display_str = f"{target} \"{datetime.datetime.fromtimestamp(int(self.contents[target])).strftime('%Y-%m-%d %H:%M:%S')}\""
+            if sanitized_target_name == "TIMESTAMP" and self.target_data.get(target):
+                try: display_str = f"{sanitized_target_name} \"{datetime.datetime.fromtimestamp(int(self.target_data[target])).strftime('%Y-%m-%d %H:%M:%S')}\""
                 except (ValueError, TypeError): pass
 
             self._safe_addstr(self.stdscr, y, 0, display_str, attr)
             last_y = y
 
         help_y_start = last_y + 2
-        help_items = [("h/l", "←→ Select Clipboard"), ("j/k", "↑↓ Navigate Targets"), ("r", "Reload"), ("q", "Quit")]
+        help_items = [("h/l", "Clipboard"), ("j/k", "Navigate"), ("r", "Reload"), ("q", "Quit"), ("↩", "View Image")]
         key_style, default_style = curses.color_pair(self.COLORS['key']), curses.color_pair(self.COLORS['default'])
 
         for i, (key, desc) in enumerate(help_items):
             y = help_y_start + i
             if y >= height: break
-            self.stdscr.addstr(y, 0, ' ' * (pane_width)) # Clear line segment
+            self.stdscr.addstr(y, 0, ' ' * (pane_width))
             desc_x = 1 + len(key) + 1
             self._safe_addstr(self.stdscr, y, 1, key, key_style)
             self._safe_addstr(self.stdscr, y, desc_x, desc, default_style)
 
-        # After drawing all text, redraw the separator to ensure it's on top.
         try: self.stdscr.vline(3, pane_width, curses.ACS_VLINE, height - 3)
         except curses.error: pass
 
     def _draw_right_pane(self, height, width):
-        """Draws content in a full-height pane, with padding and safety checks."""
+        """Draws content using separate, robust paths for text and images."""
         pane_y, pane_x = 4, (width // 3) + 1
         pane_h, pane_w = height - pane_y, width - pane_x
         if pane_h <= 0 or pane_w <= 0: return
 
         content_win = curses.newwin(pane_h, pane_w, pane_y, pane_x)
-        content = "[No target selected or target has no content]"
-        if self.navigable_indices:
-            if self.selected_nav_index >= len(self.navigable_indices): self.selected_nav_index = max(0, len(self.navigable_indices) - 1)
-            if self.navigable_indices:
-                selected_target_index = self.navigable_indices[self.selected_nav_index]
-                selected_target = self.targets[selected_target_index]
-                content = self.contents.get(selected_target, "[Error]")
+        
+        # Default message if there's nothing to show
+        if not self.navigable_indices:
+            self._safe_addstr(content_win, 0, 0, "[No target selected or target has no content]")
+            content_win.refresh()
+            return
+        
+        # Get current selection details
+        if self.selected_nav_index >= len(self.navigable_indices):
+            self.selected_nav_index = max(0, len(self.navigable_indices) - 1)
+        selected_target_index = self.navigable_indices[self.selected_nav_index]
+        selected_target = self.targets[selected_target_index]
+        raw_data = self.target_data.get(selected_target, b"")
+
+        # --- BRANCH 1: IMAGE TARGET ---
+        if re.match(IMAGE_MIME_RE, selected_target):
+            placeholder_lines = "[Image Data]\n\nPress Enter to view with chafa.".split('\n')
+            for i, line in enumerate(placeholder_lines):
+                if i >= pane_h: break
+                self._safe_addstr(content_win, i, 0, line)
+            content_win.refresh()
+            return
+            
+        # --- BRANCH 2: TEXT TARGET (Known-good logic) ---
+        decoded_text = raw_data.decode('utf-8', 'replace')
+        sanitized_content = "".join(c if c.isprintable() or c in '\n\t' else '.' for c in decoded_text)
         
         display_lines = []
-        original_lines = content.split('\n')
+        original_lines = sanitized_content.split('\n')
         for line in original_lines:
-            # FIX: Wrap to pane_w - 1 to create padding on the right.
             wrapped_sublines = textwrap.wrap(line, width=max(1, pane_w - 1), replace_whitespace=False)
-            if not wrapped_sublines: display_lines.append('')
-            else: display_lines.extend(wrapped_sublines)
+            if not wrapped_sublines:
+                display_lines.append('')
+            else:
+                display_lines.extend(wrapped_sublines)
         
         for i, line in enumerate(display_lines):
-            # FIX: Add bounds check to prevent drawing outside the window.
-            if i >= pane_h:
-                break
+            if i >= pane_h: break
             self._safe_addstr(content_win, i, 0, line)
         content_win.refresh()
 
+def show_image_with_chafa(app_instance):
+    """Exits curses, converts the image to PNG, and shows it with chafa."""
+    if not app_instance.navigable_indices:
+        return
 
-def main(stdscr):
-    try: subprocess.run(["which", "xclip"], check=True, capture_output=True)
-    except (FileNotFoundError, subprocess.CalledProcessError):
-        curses.endwin()
-        print("Error: `xclip` command not found.", file=sys.stderr)
-        sys.exit(1)
+    selected_target_index = app_instance.navigable_indices[app_instance.selected_nav_index]
+    selected_target = app_instance.targets[selected_target_index]
+    raw_data = app_instance.target_data.get(selected_target, b"")
+
+    if not raw_data:
+        print("No image data to display.")
+        input("Press Enter to continue...")
+        return
+
+    try:
+        # 1. Run the 'convert' process to transform the raw data into PNG format.
+        #    - input=raw_data: Pipes the raw image data to convert's stdin.
+        #    - ["convert", "-", "png:-"]: Reads from stdin and outputs PNG to stdout.
+        #    - capture_output=True: Captures the stdout (the PNG data) from the process.
+        convert_process = subprocess.run(
+            ["convert", "-", "png:-"],
+            input=raw_data,
+            capture_output=True,
+            check=True
+        )
+
+        # 2. Pipe the PNG data from the 'convert' process into 'chafa'.
+        #    - input=convert_process.stdout: Uses the captured output from 'convert'
+        #      as the standard input for 'chafa'.
+        subprocess.run(
+            ["chafa", "--clear"],
+            input=convert_process.stdout,
+            check=True
+        )
+
+        print("\n(Image rendered with chafa). Press Enter to return to the browser...")
+        input()
+
+    except FileNotFoundError as e:
+        # This error is raised if 'convert' or 'chafa' is not found in the system's PATH.
+        input(f"[`{e.filename}` command not found]. Please ensure ImageMagick and chafa are installed. Press Enter to continue...")
+    except subprocess.CalledProcessError as e:
+        # This block catches errors from either the 'convert' or 'chafa' command.
+        command_name = e.cmd[0]
+        # Decode the stderr from the failed process to show a useful error message.
+        error_output = e.stderr.decode('utf-8', 'replace') if e.stderr else f'Unknown error from `{command_name}`.'
+        print(f"Error during `{command_name}` execution:\n{error_output}")
+        input("Press Enter to continue...")
+
+def tui_main(stdscr):
+    """The main curses application function. It creates and runs the TUI."""
     app = Tui(stdscr)
     app.setup()
-    app.run_loop()
+    action = app.run_loop()
+    if action == "SHOW_IMAGE":
+        return app
+    return None
+
 
 if __name__ == "__main__":
-    if not os.isatty(sys.stdout.fileno()):
-         print("Error: This is a TUI application and must be run in a terminal.", file=sys.stderr)
-         sys.exit(1)
-    try: curses.wrapper(main)
-    except Exception as e: print(f"An unexpected error occurred: {e}", file=sys.stderr)
+    try: subprocess.run(["which", "xclip"], check=True, capture_output=True)
+    except (FileNotFoundError, subprocess.CalledProcessError):
+        print("Error: `xclip` command not found.", file=sys.stderr); sys.exit(1)
+
+    while True:
+        app_instance = curses.wrapper(tui_main)
+        if app_instance:
+            show_image_with_chafa(app_instance)
+        else:
+            break
