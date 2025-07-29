@@ -4,8 +4,8 @@
 """
 An interactive TUI (Text User Interface) clipboard viewer using xclip.
 
-This script features a dynamic layout where help text is displayed
-contextually below the list of targets in the left-hand pane.
+This script features a dynamic, resilient layout with a full-height pane
+separator and correctly handles all text drawing to prevent crashes.
 
 Controls:
 - Left/Right Arrows (h/l): Switch between primary, secondary, and clipboard.
@@ -22,7 +22,7 @@ import os
 
 class Tui:
     """The main class for the Text User Interface."""
-    MIN_HEIGHT = 8  # Increased slightly for the new help layout
+    MIN_HEIGHT = 8
     MIN_WIDTH = 30
 
     def __init__(self, stdscr):
@@ -51,13 +51,13 @@ class Tui:
 
 
     def _safe_addstr(self, win, y, x, text, attr=None):
-        """A robust replacement for addstr that handles all clipping and bounds checking."""
+        """A robust replacement for addstr that only truncates, preventing errors."""
         if attr is None: attr = curses.A_NORMAL
         height, width = win.getmaxyx()
         if y >= height or x >= width or y < 0 or x < 0: return
         max_len = width - x
         if max_len <= 0: return
-        truncated_text = text.ljust(max_len)[:max_len]
+        truncated_text = text[:max_len]
         try: win.addstr(y, x, truncated_text, attr)
         except curses.error: pass
 
@@ -92,7 +92,7 @@ class Tui:
         if key == ord('q'): return False
         
         if key == ord('r'):
-            self.stdscr.flash()
+            curses.flash()
             self.fetch_clipboard_data()
         elif key in (ord('j'), curses.KEY_DOWN):
             if self.navigable_indices and self.selected_nav_index < len(self.navigable_indices) - 1: self.selected_nav_index += 1
@@ -116,7 +116,7 @@ class Tui:
             running = self.handle_input(key)
 
     def draw(self):
-        """Main drawing function using the new layout."""
+        """Main drawing function."""
         height, width = self.stdscr.getmaxyx()
         self.stdscr.erase()
         if height < self.MIN_HEIGHT or width < self.MIN_WIDTH:
@@ -141,10 +141,10 @@ class Tui:
         self._safe_addstr(self.stdscr, 2, 0, xclip_cmd)
 
     def _draw_left_pane(self, height, width):
-        """Draws targets list and, immediately below it, the help text."""
+        """Draws left pane with a full-height separator line that is never overwritten."""
         pane_width = width // 3
+        
         self._safe_addstr(self.stdscr, 3, 0, "TARGETS:")
-        self._safe_addstr(self.stdscr, 3, pane_width, "│")
         
         current_target_index = self.navigable_indices[self.selected_nav_index] if self.navigable_indices else -1
         
@@ -153,41 +153,43 @@ class Tui:
             y = 4 + i
             if y >= height - 1: break
             display_str = target
+            
+            # Clear line segment before drawing
+            self.stdscr.addstr(y, 0, ' ' * (pane_width))
+            
             if i == current_target_index: attr = curses.color_pair(self.COLORS['highlight'])
             elif not self.contents.get(target): attr = curses.color_pair(self.COLORS['special']); display_str = f"* {target}"
             else: attr = curses.color_pair(self.COLORS['default'])
+                
             if target == "TIMESTAMP" and self.contents.get(target):
                 try: display_str = f"{target} \"{datetime.datetime.fromtimestamp(int(self.contents[target])).strftime('%Y-%m-%d %H:%M:%S')}\""
                 except (ValueError, TypeError): pass
-            self._safe_addstr(self.stdscr, y, 0, display_str.ljust(pane_width -1), attr)
-            self._safe_addstr(self.stdscr, y, pane_width, "│", curses.color_pair(self.COLORS['default']))
+
+            self._safe_addstr(self.stdscr, y, 0, display_str, attr)
             last_y = y
 
-        # --- Draw Help Text below the targets ---
         help_y_start = last_y + 2
-        help_items = [
-            ("h/l", "←→ Select Clipboard"),
-            ("j/k", "↑↓ Navigate Targets"),
-            ("r", "Reload"),
-            ("q", "Quit")
-        ]
-        
-        key_style = curses.color_pair(self.COLORS['key'])
-        default_style = curses.color_pair(self.COLORS['default'])
+        help_items = [("h/l", "←→ Select Clipboard"), ("j/k", "↑↓ Navigate Targets"), ("r", "Reload"), ("q", "Quit")]
+        key_style, default_style = curses.color_pair(self.COLORS['key']), curses.color_pair(self.COLORS['default'])
 
         for i, (key, desc) in enumerate(help_items):
             y = help_y_start + i
             if y >= height: break
+            self.stdscr.addstr(y, 0, ' ' * (pane_width)) # Clear line segment
             desc_x = 1 + len(key) + 1
             self._safe_addstr(self.stdscr, y, 1, key, key_style)
             self._safe_addstr(self.stdscr, y, desc_x, desc, default_style)
 
+        # After drawing all text, redraw the separator to ensure it's on top.
+        try: self.stdscr.vline(3, pane_width, curses.ACS_VLINE, height - 3)
+        except curses.error: pass
 
     def _draw_right_pane(self, height, width):
-        """Draws content in a full-height pane."""
+        """Draws content in a full-height pane, with padding and safety checks."""
         pane_y, pane_x = 4, (width // 3) + 1
         pane_h, pane_w = height - pane_y, width - pane_x
         if pane_h <= 0 or pane_w <= 0: return
+
         content_win = curses.newwin(pane_h, pane_w, pane_y, pane_x)
         content = "[No target selected or target has no content]"
         if self.navigable_indices:
@@ -200,11 +202,15 @@ class Tui:
         display_lines = []
         original_lines = content.split('\n')
         for line in original_lines:
-            wrapped_sublines = textwrap.wrap(line, width=max(1, pane_w), replace_whitespace=False)
+            # FIX: Wrap to pane_w - 1 to create padding on the right.
+            wrapped_sublines = textwrap.wrap(line, width=max(1, pane_w - 1), replace_whitespace=False)
             if not wrapped_sublines: display_lines.append('')
             else: display_lines.extend(wrapped_sublines)
         
         for i, line in enumerate(display_lines):
+            # FIX: Add bounds check to prevent drawing outside the window.
+            if i >= pane_h:
+                break
             self._safe_addstr(content_win, i, 0, line)
         content_win.refresh()
 
