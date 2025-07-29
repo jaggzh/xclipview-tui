@@ -29,12 +29,20 @@ class Tui:
 
     def __init__(self, stdscr):
         self.stdscr = stdscr
-        self.selections = ['primary', 'secondary', 'clipboard']
+        self.selections = ['clipboard', 'primary', 'secondary']
         self.current_selection_index = 0
         self.target_data = {}
         self.targets, self.navigable_indices = [], []
         self.selected_nav_index = 0
-        self.COLORS = { 'default': 1, 'highlight': 2, 'special': 3, 'header': 4, 'header_active': 5, 'key': 6 }
+        self.COLORS = {
+                'default': 1,
+                'highlight': 2,
+                'special': 3,
+                'header': 4,
+                'hdr_active': 5,
+                'hdr_target': 6,
+                'key': 7,
+                }
 
     def setup(self):
         """Initializes colors and fetches initial data."""
@@ -49,8 +57,9 @@ class Tui:
         curses.init_pair(self.COLORS['highlight'], curses.COLOR_BLACK, curses.COLOR_WHITE)
         curses.init_pair(self.COLORS['special'], 244, -1) # Grey
         curses.init_pair(self.COLORS['header'], curses.COLOR_YELLOW, curses.COLOR_BLUE)
-        curses.init_pair(self.COLORS['header_active'], curses.COLOR_BLACK, curses.COLOR_YELLOW)
+        curses.init_pair(self.COLORS['hdr_active'], curses.COLOR_BLACK, curses.COLOR_YELLOW)
         curses.init_pair(self.COLORS['key'], curses.COLOR_CYAN, -1)
+        curses.init_pair(self.COLORS['hdr_target'], curses.COLOR_BLUE, curses.COLOR_BLACK)
 
 
     def _safe_addstr(self, win, y, x, text, attr=None):
@@ -145,7 +154,7 @@ class Tui:
     def _draw_header(self, height, width):
         x_pos = 1
         for i, selection in enumerate(self.selections):
-            style = self.COLORS['header_active'] if i == self.current_selection_index else self.COLORS['header']
+            style = self.COLORS['hdr_active'] if i == self.current_selection_index else self.COLORS['header']
             display_text = f" {selection.upper()} "
             self._safe_addstr(self.stdscr, 0, x_pos, display_text, curses.color_pair(style))
             x_pos += len(display_text) + 1
@@ -159,11 +168,12 @@ class Tui:
         
         current_target_index = self.navigable_indices[self.selected_nav_index] if self.navigable_indices else -1
         
-        self._safe_addstr(self.stdscr, 3, 0, "TARGETS:")
-        
-        last_y = 3
+        last_y = 4
+        self._safe_addstr(self.stdscr, last_y, 0, "TARGETS:", curses.color_pair(self.COLORS['hdr_target']))
+
+        y_target_list = last_y + 1
         for i, target in enumerate(self.targets):
-            y = 4 + i
+            y = y_target_list + i
             if y >= height - 1: break
             
             sanitized_target_name = "".join(c for c in target if c.isprintable())
@@ -172,14 +182,24 @@ class Tui:
             self.stdscr.addstr(y, 0, ' ' * (pane_width))
             
             if i == current_target_index: attr = curses.color_pair(self.COLORS['highlight'])
-            elif not self.target_data.get(target): attr = curses.color_pair(self.COLORS['special']); display_str = f"* {sanitized_target_name}"
+            elif not self.target_data.get(target): attr = curses.color_pair(self.COLORS['special']); display_str = f"{sanitized_target_name}"
             else: attr = curses.color_pair(self.COLORS['default'])
                 
+            pfx_attr = None
+            target_pfx = '  '
+
             if sanitized_target_name == "TIMESTAMP" and self.target_data.get(target):
                 try: display_str = f"{sanitized_target_name} \"{datetime.datetime.fromtimestamp(int(self.target_data[target])).strftime('%Y-%m-%d %H:%M:%S')}\""
                 except (ValueError, TypeError): pass
+            elif not self.target_data.get(target):
+                target_pfx = '? '
+                pfx_attr = None
+                display_str = sanitized_target_name
+            else:
+                display_str = sanitized_target_name
 
-            self._safe_addstr(self.stdscr, y, 0, display_str, attr)
+            self._safe_addstr(self.stdscr, y, 0, target_pfx, pfx_attr)
+            self._safe_addstr(self.stdscr, y, 2, display_str, attr)
             last_y = y
 
         help_y_start = last_y + 2
@@ -315,3 +335,5 @@ if __name__ == "__main__":
             show_image_with_chafa(app_instance)
         else:
             break
+
+# vim: et ts=4 sw=4
