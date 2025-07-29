@@ -1,0 +1,203 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+
+"""
+An interactive TUI (Text User Interface) clipboard viewer using xclip.
+
+This script is architected to be highly resilient to terminal resizing,
+preventing common ncurses errors by safely handling all text drawing.
+
+Controls:
+- Left/Right Arrows (h/l): Switch between primary, secondary, and clipboard.
+- Up/Down Arrows (k/j):   Navigate the list of available targets.
+- q:                      Quit the application.
+"""
+import curses
+import subprocess
+import datetime
+import textwrap
+import sys
+import os
+
+class Tui:
+    """The main class for the Text User Interface."""
+    MIN_HEIGHT = 5
+    MIN_WIDTH = 20
+
+    def __init__(self, stdscr):
+        self.stdscr = stdscr
+        self.selections = ['primary', 'secondary', 'clipboard']
+        self.current_selection_index = 0
+        self.targets, self.contents, self.navigable_indices = [], {}, []
+        self.selected_nav_index = 0
+        self.COLORS = { 'default': 1, 'highlight': 2, 'special': 3, 'header': 4, 'header_active': 5 }
+
+    def setup(self):
+        """Initializes colors and fetches initial data."""
+        curses.curs_set(0)
+        self._init_colors()
+        self.fetch_clipboard_data()
+
+    def _init_colors(self):
+        curses.start_color()
+        curses.use_default_colors()
+        curses.init_pair(self.COLORS['default'], curses.COLOR_WHITE, -1)
+        curses.init_pair(self.COLORS['highlight'], curses.COLOR_BLACK, curses.COLOR_WHITE)
+        curses.init_pair(self.COLORS['special'], 244, -1)
+        curses.init_pair(self.COLORS['header'], curses.COLOR_YELLOW, curses.COLOR_BLUE)
+        curses.init_pair(self.COLORS['header_active'], curses.COLOR_BLACK, curses.COLOR_YELLOW)
+
+    def _safe_addstr(self, win, y, x, text, attr=None):
+        """
+        A robust replacement for addstr that handles all clipping and bounds
+        checking to prevent curses errors.
+        """
+        if attr is None: attr = curses.A_NORMAL
+        height, width = win.getmaxyx()
+        # Check if the starting position is valid
+        if y >= height or x >= width or y < 0 or x < 0:
+            return
+        # Calculate the number of available characters
+        max_len = width - x
+        if max_len <= 0:
+            return
+        # Truncate the string to fit
+        truncated_text = text.ljust(max_len)[:max_len]
+        try:
+            win.addstr(y, x, truncated_text, attr)
+        except curses.error:
+            # This is the final failsafe, but should not be triggered.
+            # It can happen if `text` contains wide unicode chars.
+            pass
+
+    def fetch_clipboard_data(self):
+        """Fetches all targets and content for the current clipboard."""
+        self.targets, self.contents, self.navigable_indices = [], {}, []
+        self.selected_nav_index = 0
+        selection_name = self.selections[self.current_selection_index]
+        try:
+            targets_raw = subprocess.check_output(
+                ["xclip", "-selection", selection_name, "-t", "TARGETS", "-o"],
+                stderr=subprocess.PIPE, text=True, errors='ignore'
+            )
+            self.targets = [t for t in targets_raw.strip().split('\n') if t]
+        except (FileNotFoundError, subprocess.CalledProcessError): return
+        for i, target in enumerate(self.targets):
+            try:
+                content_bytes = subprocess.check_output(
+                    ["xclip", "-selection", selection_name, "-t", target, "-o"],
+                    stderr=subprocess.DEVNULL
+                )
+                decoded_content = "".join(
+                    char if char.isprintable() or char in '\n\t' else '.'
+                    for char in content_bytes.decode('utf-8', errors='replace')
+                )
+                self.contents[target] = decoded_content
+                if decoded_content: self.navigable_indices.append(i)
+            except subprocess.CalledProcessError: self.contents[target] = ""
+
+    def handle_input(self, key):
+        """Processes user key presses."""
+        if key == ord('q'): return False
+        if key in (ord('j'), curses.KEY_DOWN):
+            if self.navigable_indices and self.selected_nav_index < len(self.navigable_indices) - 1: self.selected_nav_index += 1
+        elif key in (ord('k'), curses.KEY_UP):
+            if self.navigable_indices and self.selected_nav_index > 0: self.selected_nav_index -= 1
+        elif key in (ord('h'), curses.KEY_LEFT):
+            if self.current_selection_index > 0:
+                self.current_selection_index -= 1; self.fetch_clipboard_data()
+        elif key in (ord('l'), curses.KEY_RIGHT):
+            if self.current_selection_index < len(self.selections) - 1:
+                self.current_selection_index += 1; self.fetch_clipboard_data()
+        return True
+
+    def run_loop(self):
+        """Main application loop."""
+        running = True
+        while running:
+            self.draw()
+            key = self.stdscr.getch()
+            if key == curses.KEY_RESIZE: continue
+            running = self.handle_input(key)
+
+    def draw(self):
+        """Main drawing function, now using _safe_addstr for all drawing."""
+        height, width = self.stdscr.getmaxyx()
+        self.stdscr.erase()
+        if height < self.MIN_HEIGHT or width < self.MIN_WIDTH:
+            self._safe_addstr(self.stdscr, 0, 0, "Terminal too small.")
+            self.stdscr.refresh()
+            return
+        self._draw_header(height, width)
+        self._draw_left_pane(height, width)
+        self._draw_footer(height, width)
+        self.stdscr.refresh()
+        self._draw_right_pane(height, width)
+
+    def _draw_header(self, height, width):
+        x_pos = 1
+        for i, selection in enumerate(self.selections):
+            style = self.COLORS['header_active'] if i == self.current_selection_index else self.COLORS['header']
+            display_text = f" {selection.upper()} "
+            self._safe_addstr(self.stdscr, 0, x_pos, display_text, curses.color_pair(style))
+            x_pos += len(display_text) + 1
+        self._safe_addstr(self.stdscr, 1, 0, "─" * width)
+        xclip_cmd = f"$ xclip -selection {self.selections[self.current_selection_index]} -t TARGETS -o"
+        self._safe_addstr(self.stdscr, 2, 0, xclip_cmd)
+
+    def _draw_left_pane(self, height, width):
+        pane_width = width // 3
+        self._safe_addstr(self.stdscr, 3, 0, "TARGETS:")
+        self._safe_addstr(self.stdscr, 3, pane_width, "│")
+        current_target_index = self.navigable_indices[self.selected_nav_index] if self.navigable_indices else -1
+        for i, target in enumerate(self.targets):
+            y = 4 + i
+            if y >= height - 2: break
+            display_str = target
+            if i == current_target_index: attr = curses.color_pair(self.COLORS['highlight'])
+            elif not self.contents.get(target): attr = curses.color_pair(self.COLORS['special']); display_str = f"* {target}"
+            else: attr = curses.color_pair(self.COLORS['default'])
+            if target == "TIMESTAMP" and self.contents.get(target):
+                try: display_str = f"{target} \"{datetime.datetime.fromtimestamp(int(self.contents[target])).strftime('%Y-%m-%d %H:%M:%S')}\""
+                except (ValueError, TypeError): pass
+            self._safe_addstr(self.stdscr, y, 0, display_str.ljust(pane_width -1), attr)
+            self._safe_addstr(self.stdscr, y, pane_width, "│", curses.color_pair(self.COLORS['default']))
+
+    def _draw_right_pane(self, height, width):
+        pane_y, pane_x = 4, (width // 3) + 1
+        pane_h, pane_w = height - pane_y - 2, width - pane_x
+        if pane_h <= 0 or pane_w <= 0: return
+        content_win = curses.newwin(pane_h, pane_w, pane_y, pane_x)
+        content = "[No target selected or target has no content]"
+        if self.navigable_indices:
+            if self.selected_nav_index >= len(self.navigable_indices): self.selected_nav_index = max(0, len(self.navigable_indices) - 1)
+            if self.navigable_indices:
+                selected_target_index = self.navigable_indices[self.selected_nav_index]
+                selected_target = self.targets[selected_target_index]
+                content = self.contents.get(selected_target, "[Error]")
+        wrapped_lines = textwrap.wrap(content, width=max(1, pane_w))
+        for i, line in enumerate(wrapped_lines):
+            self._safe_addstr(content_win, i, 0, line)
+        content_win.refresh()
+
+    def _draw_footer(self, height, width):
+        self._safe_addstr(self.stdscr, height - 2, 0, "─" * width)
+        help_text = "h/l ←→ Clipboard | j/k ↑↓ Navigate | q Quit"
+        self._safe_addstr(self.stdscr, height - 1, 1, help_text)
+
+def main(stdscr):
+    try: subprocess.run(["which", "xclip"], check=True, capture_output=True)
+    except (FileNotFoundError, subprocess.CalledProcessError):
+        curses.endwin()
+        print("Error: `xclip` command not found.", file=sys.stderr)
+        sys.exit(1)
+    app = Tui(stdscr)
+    app.setup()
+    app.run_loop()
+
+if __name__ == "__main__":
+    if not os.isatty(sys.stdout.fileno()):
+         print("Error: This is a TUI application and must be run in a terminal.", file=sys.stderr)
+         sys.exit(1)
+    try: curses.wrapper(main)
+    except Exception as e: print(f"An unexpected error occurred: {e}", file=sys.stderr)
